@@ -1,0 +1,75 @@
+{
+  "Comment": "Orquestração dos jobs de ETL usando Step Functions",
+  "StartAt": "ExtractStocksJob",
+  "States": {
+    "ExtractStocksJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "stocks_yfinance"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FailState"
+        }
+      ],
+      "Next": "ExtractNewsJob"
+    },
+    "ExtractNewsJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "news_scraper"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FailState"
+        }
+      ],
+      "Next": "TransformStocksJob"
+    },
+    "TransformStocksJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "stocks_transform"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FailState"
+        }
+      ],
+      "Next": "TransformNewsJob"
+    },
+    "TransformNewsJob": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "news_transformer"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FailState"
+        }
+      ],
+      "End": true
+    },
+    "FailState": {
+      "Type": "Fail",
+      "Error": "JobFailed",
+      "Cause": "A execução do job falhou."
+    }
+  }
+}

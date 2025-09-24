@@ -1,0 +1,318 @@
+import sys
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsglue.dynamicframe import DynamicFrame
+
+from pyspark.sql.functions import col, regexp_replace, to_date, lit
+from pyspark.sql.types import StringType
+from logging import getLogger, basicConfig, INFO
+from datetime import datetime
+import boto3
+from botocore.exceptions import ClientError
+
+# ======================== CLIENTS ========================
+glue_client = boto3.client("glue")
+athena_client = boto3.client("athena", region_name="us-east-1")  # ajuste a região
+
+# ======================== LOGGING ========================
+basicConfig(level=INFO, format="%(asctime)s - %(levelname)s - %(funcName)s - %(message)s")
+logger = getLogger(__name__)
+
+# ======================== PARAMS ========================
+args = getResolvedOptions(sys.argv, [
+    'JOB_NAME',
+    'SOURCE_DB',
+    'SOURCE_TABLE',
+    'TARGET_BUCKET',
+    'TARGET_PREFIX',
+    'TARGET_DB',
+    'TARGET_TABLE'
+])
+
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# ======================== FUNÇÕES ========================
+def debug_dataframe_schema(df):
+    logger.info("=== DEBUGGING DATAFRAME SCHEMA ===")
+    logger.info(f"Total de colunas: {len(df.columns)}")
+    logger.info(f"Nomes das colunas: {df.columns}")
+    df.printSchema()
+    try:
+        sample_data = df.limit(3).collect()
+        for i, row in enumerate(sample_data):
+            logger.info(f"Row {i}: {row.asDict()}")
+    except Exception as e:
+        logger.error(f"Erro ao coletar dados de sample: {e}")
+    return df
+
+def normalize_column_names(df):
+    logger.info("Normalizando nomes das colunas...")
+    column_mapping = {}
+    expected_columns = [
+        "title", "link", "source", "published_time", 
+        "company", "ticker", "sector", "search_term", "extracted_at"
+    ]
+    current_columns = [col.lower().strip() for col in df.columns]
+    missing_columns = []
+    for expected_col in expected_columns:
+        if expected_col not in current_columns:
+            possible_matches = [col for col in current_columns if expected_col.replace('_', '') in col.replace('_', '')]
+            if possible_matches:
+                column_mapping[possible_matches[0]] = expected_col
+                logger.info(f"Mapeando '{possible_matches[0]}' para '{expected_col}'")
+            else:
+                missing_columns.append(expected_col)
+    if missing_columns:
+        for missing_col in missing_columns:
+            df = df.withColumn(missing_col, lit(None).cast(StringType()))
+            logger.info(f"Adicionada coluna '{missing_col}' com valores nulos")
+    for old_name, new_name in column_mapping.items():
+        if old_name in df.columns:
+            df = df.withColumnRenamed(old_name, new_name)
+    return df
+
+def clean_data(df):
+    logger.info("Starting data cleaning process...")
+    df = debug_dataframe_schema(df)
+    df = normalize_column_names(df)
+
+    required_columns = ["published_time", "extracted_at"]
+    for req_col in required_columns:
+        if req_col not in df.columns:
+            raise ValueError(f"Coluna '{req_col}' é obrigatória mas não foi encontrada")
+
+    df = df \
+        .withColumn("published_date_str", regexp_replace(col("published_time"), "T.*", "")) \
+        .withColumn("extracted_date_str", regexp_replace(col("extracted_at"), "T.*", ""))
+
+    df = df \
+        .withColumn("published_date", to_date(col("published_date_str"), "yyyy-MM-dd")) \
+        .withColumn("extracted_date", to_date(col("extracted_date_str"), "yyyy-MM-dd"))
+
+    df = df.filter(
+        col("published_date").isNotNull() &
+        col("extracted_date").isNotNull() &
+        (col("published_date") == col("extracted_date"))
+    )
+
+    df = df.drop("published_date_str", "extracted_date_str", "published_date", "extracted_date")
+    df = df.dropDuplicates()
+
+    if "link" in df.columns:
+        df = df.dropDuplicates(["link"])
+
+    critical_columns = ["title", "link", "source"]
+    existing_critical_columns = [c for c in critical_columns if c in df.columns]
+    if existing_critical_columns:
+        df = df.na.drop(subset=existing_critical_columns)
+
+    if df.count() == 0:
+        logger.warning("ATENÇÃO: DataFrame vazio após limpeza!")
+    df.show()
+    return df
+
+def save_to_s3_and_catalog(df):
+    if df.count() == 0:
+        logger.warning("DataFrame vazio, pulando salvamento...")
+        return
+
+    proc_date = datetime.now().strftime('%Y%m%d')
+    output_path = f"s3://{args['TARGET_BUCKET']}/{args['TARGET_PREFIX']}/dataproc={proc_date}/"
+    logger.info(f"Saving to {output_path}")
+
+    df = df.withColumn("dataproc", lit(proc_date))
+    df.write \
+        .mode("append") \
+        .option("compression", "snappy") \
+        .partitionBy("dataproc") \
+        .parquet(output_path)
+
+    dynamic_frame = DynamicFrame.fromDF(df, glueContext, "dynamic_frame")
+    glueContext.write_dynamic_frame.from_catalog(
+        frame=dynamic_frame,
+        database=args['TARGET_DB'],
+        table_name=args['TARGET_TABLE'],
+        additional_options={"partitionKeys": ["dataproc"]}
+    )
+    logger.info("Data registered in Glue Catalog.")
+
+def ensure_target_table_exists():
+    try:
+        glue_client.get_table(
+            DatabaseName=args['TARGET_DB'],
+            Name=args['TARGET_TABLE']
+        )
+        logger.info(f"Tabela {args['TARGET_DB']}.{args['TARGET_TABLE']} já existe no Glue Catalog.")
+    except glue_client.exceptions.EntityNotFoundException:
+        logger.warning(f"Tabela {args['TARGET_DB']}.{args['TARGET_TABLE']} não existe. Criando...")
+
+        try:
+            glue_client.create_table(
+                DatabaseName=args['TARGET_DB'],
+                TableInput={
+                    "Name": args['TARGET_TABLE'],
+                    "StorageDescriptor": {
+                        "Columns": [
+                            {"Name": "title", "Type": "string"},
+                            {"Name": "link", "Type": "string"},
+                            {"Name": "source", "Type": "string"},
+                            {"Name": "published_time", "Type": "string"},
+                            {"Name": "company", "Type": "string"},
+                            {"Name": "ticker", "Type": "string"},
+                            {"Name": "sector", "Type": "string"},
+                            {"Name": "search_term", "Type": "string"},
+                            {"Name": "extracted_at", "Type": "string"}
+                        ],
+                        "Location": f"s3://{args['TARGET_BUCKET']}/{args['TARGET_PREFIX']}/",
+                        "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                        "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                        "SerdeInfo": {
+                            "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+                            "Parameters": {"serialization.format": "1"}
+                        }
+                    },
+                    "PartitionKeys": [
+                        {"Name": "dataproc", "Type": "string"}
+                    ],
+                    "TableType": "EXTERNAL_TABLE",
+                    "Parameters": {
+                        "classification": "parquet",
+                        "compressionType": "snappy"
+                    }
+                }
+            )
+            logger.info(f"Tabela {args['TARGET_DB']}.{args['TARGET_TABLE']} criada com sucesso!")
+        except ClientError as ce:
+            logger.error(f"Erro ao criar tabela: {ce}")
+            raise
+
+def add_partition_if_not_exists(database, table, proc_date, location):
+    """Adiciona manualmente uma partição no Glue Catalog se não existir"""
+    try:
+        glue_client.get_partition(
+            DatabaseName=database,
+            TableName=table,
+            PartitionValues=[proc_date]
+        )
+        logger.info(f"Partição {proc_date} já existe no Glue Catalog.")
+    except glue_client.exceptions.EntityNotFoundException:
+        logger.info(f"Partição {proc_date} não existe. Criando...")
+        glue_client.create_partition(
+            DatabaseName=database,
+            TableName=table,
+            PartitionInput={
+                "Values": [proc_date],
+                "StorageDescriptor": {
+                    "Columns": [
+                        {"Name": "title", "Type": "string"},
+                        {"Name": "link", "Type": "string"},
+                        {"Name": "source", "Type": "string"},
+                        {"Name": "published_time", "Type": "string"},
+                        {"Name": "company", "Type": "string"},
+                        {"Name": "ticker", "Type": "string"},
+                        {"Name": "sector", "Type": "string"},
+                        {"Name": "search_term", "Type": "string"},
+                        {"Name": "extracted_at", "Type": "string"}
+                    ],
+                    "Location": location,
+                    "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+                    "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+                    "SerdeInfo": {
+                        "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+                        "Parameters": {"serialization.format": "1"}
+                    }
+                }
+            }
+        )
+        logger.info(f"Partição {proc_date} criada no Glue Catalog.")
+
+def repair_table_partitions(database, table):
+    """Executa MSCK REPAIR TABLE (Spark → Athena → Manual)"""
+    try:
+        # 1. Spark SQL
+        spark.sql(f"MSCK REPAIR TABLE {database}.{table}")
+        logger.info(f"MSCK REPAIR TABLE executado no Spark para {database}.{table}")
+
+        partitions_df = spark.sql(f"SHOW PARTITIONS {database}.{table}")
+        logger.info(f"Total de partições: {partitions_df.count()}")
+        for row in partitions_df.collect():
+            logger.info(f"  - {row[0]}")
+
+    except Exception as e:
+        logger.warning(f"MSCK REPAIR TABLE falhou no Spark: {e}")
+
+        # 2. Athena
+        try:
+            query = f"MSCK REPAIR TABLE {table}"
+            response = athena_client.start_query_execution(
+                QueryString=query,
+                QueryExecutionContext={"Database": database},
+                ResultConfiguration={
+                    "OutputLocation": f"s3://{args['TARGET_BUCKET']}/athena-query-results/"
+                }
+            )
+            qid = response["QueryExecutionId"]
+            logger.info(f"MSCK REPAIR TABLE disparado no Athena (QueryExecutionId={qid})")
+        except Exception as athena_error:
+            logger.warning(f"MSCK REPAIR TABLE falhou no Athena: {athena_error}")
+
+            # 3. Manual
+            try:
+                proc_date = datetime.now().strftime('%Y%m%d')
+                partition_location = f"s3://{args['TARGET_BUCKET']}/{args['TARGET_PREFIX']}/dataproc={proc_date}/"
+                add_partition_if_not_exists(database, table, proc_date, partition_location)
+            except Exception as manual_error:
+                logger.error(f"Erro ao adicionar partição manualmente: {manual_error}")
+
+# ======================== MAIN ========================
+def main():
+    try:
+        logger.info(">>> STEP 0: Garantindo tabela de saída no Catalog <<<")
+        ensure_target_table_exists()
+
+        logger.info(">>> STEP 1: Reading Raw Data <<<")
+        df_raw = None
+
+        if args['SOURCE_TABLE']:
+            logger.info(f"Lendo do Catalog: {args['SOURCE_DB']}.{args['SOURCE_TABLE']}")
+            dyf_raw = glueContext.create_dynamic_frame.from_catalog(
+                database=args['SOURCE_DB'],
+                table_name=args['SOURCE_TABLE']
+            )
+            df_raw = dyf_raw.toDF()
+
+        if df_raw is None or df_raw.count() == 0:
+            proc_date = datetime.now().strftime("%Y%m%d")
+            input_path = f"s3://{args['TARGET_BUCKET']}/raw/news/dataproc={proc_date}/"
+            logger.info(f"Catalog vazio. Lendo direto do S3: {input_path}")
+            df_raw = spark.read.parquet(input_path)
+
+        if df_raw.count() == 0:
+            logger.warning("DataFrame de origem está vazio!")
+            return
+
+        logger.info(">>> STEP 2: Cleaning Data <<<")
+        df_clean = clean_data(df_raw)
+
+        logger.info(">>> STEP 3: Saving to S3 and Catalog <<<")
+        save_to_s3_and_catalog(df_clean)
+
+        logger.info(">>> STEP 4: Repairing Partitions <<<")
+        repair_table_partitions(args['TARGET_DB'], args['TARGET_TABLE'])
+
+        logger.info("Job finished successfully!")
+
+    except Exception as e:
+        logger.error(f"Erro durante execução do job: {e}")
+        raise e
+
+if __name__ == "__main__":
+    main()
+    job.commit()
