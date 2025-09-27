@@ -6,7 +6,7 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::glue:startJobRun.sync",
       "Parameters": {
-        "JobName": "stocks_yfinance"
+        "JobName": "extract_stocks_job"
       },
       "Catch": [
         {
@@ -22,7 +22,7 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::glue:startJobRun.sync",
       "Parameters": {
-        "JobName": "news_scraper"
+        "JobName": "extract_news_job"
       },
       "Catch": [
         {
@@ -38,7 +38,7 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::glue:startJobRun.sync",
       "Parameters": {
-        "JobName": "stocks_transform"
+        "JobName": "transform_stocks_job"
       },
       "Catch": [
         {
@@ -54,7 +54,7 @@
       "Type": "Task",
       "Resource": "arn:aws:states:::glue:startJobRun.sync",
       "Parameters": {
-        "JobName": "news_transformer"
+        "JobName": "transform_news_job"
       },
       "Catch": [
         {

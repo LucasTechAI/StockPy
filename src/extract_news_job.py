@@ -6,19 +6,16 @@ from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from awsglue.job import Job
 
+from pyspark.sql.types import StructType, StructField, StringType
 from logging import getLogger, basicConfig, INFO
+from boto3 import client as boto3_client
+from pyspark.sql.functions import lit
 from urllib.parse import quote
 from bs4 import BeautifulSoup
 from datetime import datetime
 from requests import Session
 from time import sleep
-import boto3
-import json
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lit
-from pyspark.sql.types import StructType, StructField, StringType
 
-# Initialize Glue components
 args = getResolvedOptions(sys.argv, ['JOB_NAME'])
 sc = SparkContext()
 glueContext = GlueContext(sc)
@@ -26,12 +23,33 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-# Configuration
 RAW_DATA_PATH = "s3://stockpy/raw/news/"
 DB_NAME = "news_db"
-TABLE_NAME = "news_row"
+TABLE_NAME = "news_raw"
 
-# Setup logging
+STOCKS = {
+    "Banks": {
+        "ITUB4.SA": "Itaú Unibanco",
+        "BBAS3.SA": "Banco do Brasil"
+    },
+    "Energy": {
+        "ISAE4.SA": "ISA Energia",
+        "CPFE3.SA": "CPFL Energia"
+    },
+    "Sanitation": {
+        "SBSP3.SA": "Sabesp",
+        "SAPR4.SA": "Sanepar"
+    },
+    "Insurance": {
+        "PSSA3.SA": "Porto Seguro",
+        "BBSE3.SA": "BB Seguridade"
+    },
+    "Telecommunications": {
+        "VIVT3.SA": "Vivo",
+        "INTB3.SA": "Intelbras"
+    }
+}
+
 basicConfig(level=INFO, format="%(asctime)s - %(levelname)s - %(funcName)s - %(message)s")
 logger = getLogger(__name__)
 
@@ -40,6 +58,11 @@ class GlueGoogleNewsExtractor:
     Extracts news articles from Google News for AWS Glue jobs.
     """
     def __init__(self, stocks_dict: dict) -> None:
+        """
+        Initializes the extractor with stock configurations and HTTP session.
+        Args:
+            stocks_dict (dict): Dictionary with stock tickers and company names.
+        """
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -51,15 +74,31 @@ class GlueGoogleNewsExtractor:
         self.stocks = stocks_dict
         self.session = Session()
         self.session.headers.update(self.headers)
-        self.s3_client = boto3.client('s3')
+        self.s3_client = boto3_client('s3')
 
-    def __get_title(self, article) -> str:
-        title_elem = (article.find('h3') or 
-                      article.find('h4') or 
+
+    def __get_title(self, article: BeautifulSoup) -> str:
+        """
+        Extracts the title from a news article element.
+        Args:
+            article (bs4.element.Tag): BeautifulSoup Tag object representing the article.
+        Returns:
+            str: The extracted title text.
+        """
+        title_elem = (article.find('h3') or
+                      article.find('h4') or
                       article.find('a', attrs={'data-n-tid': True}))
         return title_elem.get_text(strip=True) if title_elem else ""
 
-    def __get_link(self, article) -> str:
+
+    def __get_link(self, article: BeautifulSoup) -> str:
+        """
+        Extracts the link from a news article element.
+        Args:
+            article (bs4.element.Tag): BeautifulSoup Tag object representing the article.
+        Returns:
+            str: The extracted link URL.
+        """
         link_elem = article.find('a')
         link = ''
         if link_elem and link_elem.get('href'):
@@ -70,31 +109,75 @@ class GlueGoogleNewsExtractor:
                 link = f"https://news.google.com{link}"
         return link
 
-    def __get_source(self, article) -> str:
+
+    def __get_source(self, article: BeautifulSoup) -> str:
+        """
+        Extracts the source from a news article element.
+        Args:
+            article (bs4.element.Tag): BeautifulSoup Tag object representing the article.
+        Returns:
+            str: The extracted source text.
+        """
         source_elem = (article.find('div', attrs={'data-n-tid': True}) or
                        article.find('span', attrs={'data-n-tid': True}) or
                        article.find(attrs={'data-n-tid': True}))
         return source_elem.get_text(strip=True) if source_elem else 'Google News'
 
-    def __get_date_published(self, article) -> str:
+
+    def __get_date_published(self, article: BeautifulSoup) -> str:
+        """
+        Extracts the publication date from a news article element.
+        Args:
+            article (bs4.element.Tag): BeautifulSoup Tag object representing the article.
+        Returns:
+            str: The extracted publication date as a string.
+        """
         time_elem = article.find('time')
         if time_elem:
             return time_elem.get('datetime') or time_elem.get_text(strip=True) or ""
         return ""
 
+
     def __get_sector(self, ticker: str) -> str:
+        """
+        Extracts the sector from a stock ticker.
+        Args:
+            ticker (str): The stock ticker symbol.
+        Returns:
+            str: The sector associated with the stock ticker.
+        """
         for sector, companies in self.stocks.items():
             if ticker in companies:
                 return sector
         return "Unknown"
+    
+    
     def __sanitize_text(self, text: str) -> str:
+        """
+        Sanitizes text to ensure UTF-8 encoding and removes unwanted characters.
+        Args:
+            text (str): The text to sanitize.
+        Returns:
+            str: The sanitized text.
+        """
         if not text:
             return ""
         try:
             return text.encode("utf-8", "ignore").decode("utf-8").strip()
         except Exception:
             return str(text).strip()
+    
+    
     def __process_news(self, search_term: str, company_name: str, ticker: str) -> list:
+        """
+        Processes news articles for a given search term.
+        Args:
+            search_term (str): The search term to query Google News.
+            company_name (str): The name of the company.
+            ticker (str): The stock ticker symbol.
+        Returns:
+            list: A list of dictionaries containing news article details.
+        """
         news = []
         try:
             encoded_query = quote(search_term)
@@ -139,7 +222,16 @@ class GlueGoogleNewsExtractor:
             logger.warning(f"Error fetching news for '{search_term}': {e}")
         return news
 
+
     def _extract_google_news(self, company_name: str, ticker: str) -> list:
+        """
+        Extracts news articles from Google News for a given company.
+        Args:
+            company_name (str): The name of the company.
+            ticker (str): The stock ticker symbol.
+        Returns:
+            list: A list of dictionaries containing news article details.
+        """
         try:
             search_terms = [
                 f"Empresa {company_name}",
@@ -151,7 +243,6 @@ class GlueGoogleNewsExtractor:
             for search_term in search_terms:
                 try:
                     results = self.__process_news(search_term, company_name, ticker)
-                    print(results)
                     if results:
                         news.extend(list(results))
                     sleep(2)
@@ -163,7 +254,13 @@ class GlueGoogleNewsExtractor:
             logger.error(f"General error extracting news for {company_name}: {e}")
             return []
 
+
     def extract_and_save_to_s3(self) -> bool:
+        """
+        Extracts news articles and saves them to S3 in Parquet format.
+        Returns:
+            bool: True if successful, False otherwise.
+        """
         try:
             logger.info("Initiating Google News extraction...")
             all_news = []
@@ -176,11 +273,9 @@ class GlueGoogleNewsExtractor:
                     current_company += 1
                     logger.info(f"[{current_company}/{total_companies}] {company_name} ({ticker})")
                     company_news = self._extract_google_news(company_name, ticker)
-                    print(company_news)
                     if company_news:
                         all_news.extend(list(company_news))
                     sleep(3)
-            print(all_news)
 
             if not all_news:
                 logger.warning("No news articles extracted")
@@ -229,7 +324,11 @@ class GlueGoogleNewsExtractor:
             logger.error(traceback.format_exc())
             return False
 
-    def _create_glue_catalog_table(self):
+
+    def _create_glue_catalog_table(self) -> None:
+        """
+        Creates or updates the Glue Catalog table for the news articles.
+        """
         try:
             logger.info(f"Creating/updating Glue Catalog table {DB_NAME}.{TABLE_NAME}")
             spark.sql(f"CREATE DATABASE IF NOT EXISTS {DB_NAME}")
@@ -267,47 +366,25 @@ class GlueGoogleNewsExtractor:
             logger.error(traceback.format_exc())
             raise
 
-    def _repair_table_partitions(self):
+
+    def _repair_table_partitions(self) -> None:
+        """
+        Repairs the table partitions in the Glue Catalog.
+        """
         try:
             logger.info(f"Repairing table partitions for {DB_NAME}.{TABLE_NAME}")
             spark.sql(f"MSCK REPAIR TABLE {DB_NAME}.{TABLE_NAME}")
         except Exception as e:
             logger.error(f"Error executing MSCK REPAIR TABLE: {e}")
             logger.error(traceback.format_exc())
-
-def get_stocks_configuration():
-    return {
-        "Banks": {
-            "ITUB4.SA": "Itaú Unibanco",
-            "BBAS3.SA": "Banco do Brasil"
-        },
-        "Energy": {
-            "ISAE4.SA": "ISA Energia",
-            "CPFE3.SA": "CPFL Energia"
-        },
-        "Sanitation": {
-            "SBSP3.SA": "Sabesp",
-            "SAPR4.SA": "Sanepar"
-        },
-        "Insurance": {
-            "PSSA3.SA": "Porto Seguro",
-            "BBSE3.SA": "BB Seguridade"
-        },
-        "Telecommunications": {
-            "VIVT3.SA": "Vivo",
-            "INTB3.SA": "Intelbras"
-        }
-    }
     
 
 
 def main():
     try:
         logger.info("Starting Google News extraction Glue job...")
-        stocks_config = get_stocks_configuration()
-        extractor = GlueGoogleNewsExtractor(stocks_config)
+        extractor = GlueGoogleNewsExtractor(STOCKS)
         success = extractor.extract_and_save_to_s3()
-        print(success)
         if success:
             logger.info("News extraction job completed successfully")
         else:
@@ -317,9 +394,8 @@ def main():
         logger.error(f"Job failed with error: {e}")
         logger.error(traceback.format_exc())
         raise
+    finally:
+        job.commit()
 
 if __name__ == "__main__":
     main()
-
-# Commit the job
-job.commit()
