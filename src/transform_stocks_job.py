@@ -11,15 +11,17 @@ from logging import getLogger, basicConfig, INFO
 from pyspark.sql.window import Window
 from datetime import datetime
 
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+args = getResolvedOptions(sys.argv, ["JOB_NAME"])
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
+job.init(args["JOB_NAME"], args)
 
-basicConfig(level=INFO, format="%(asctime)s - %(levelname)s - %(funcName)s - %(message)s")
+basicConfig(
+    level=INFO, format="%(asctime)s - %(levelname)s - %(funcName)s - %(message)s"
+)
 logger = getLogger(__name__)
 
 
@@ -126,16 +128,17 @@ def clean_data(df: DataFrame) -> DataFrame:
     Returns:
         DataFrame: The cleaned DataFrame.
     """
-    df_clean = df \
-        .withColumn("date", to_date(col("date"), "yyyy-MM-dd")) \
-        .withColumn("close", col("close").cast(DoubleType())) \
-        .withColumn("high", col("high").cast(DoubleType())) \
-        .withColumn("low", col("low").cast(DoubleType())) \
-        .withColumn("open", col("open").cast(DoubleType())) \
-        .withColumn("volume", col("volume").cast(LongType())) \
-        .filter(col("sector").isNotNull()) \
-        .filter(col("close") > 0) \
+    df_clean = (
+        df.withColumn("date", to_date(col("date"), "yyyy-MM-dd"))
+        .withColumn("close", col("close").cast(DoubleType()))
+        .withColumn("high", col("high").cast(DoubleType()))
+        .withColumn("low", col("low").cast(DoubleType()))
+        .withColumn("open", col("open").cast(DoubleType()))
+        .withColumn("volume", col("volume").cast(LongType()))
+        .filter(col("sector").isNotNull())
+        .filter(col("close") > 0)
         .filter(col("volume") > 0)
+    )
     return df_clean
 
 
@@ -148,16 +151,17 @@ def rename_columns(df: DataFrame) -> DataFrame:
     Returns:
         DataFrame: The DataFrame with renamed columns.
     """
-    df = df \
-        .withColumnRenamed("date", "data") \
-        .withColumnRenamed("close", "precoFechamento") \
-        .withColumnRenamed("high", "precoMaximo") \
-        .withColumnRenamed("low", "precoMinimo") \
-        .withColumnRenamed("open", "precoAbertura") \
-        .withColumnRenamed("volume", "volumeNegociacao") \
-        .withColumnRenamed("ticker", "codigoAcao") \
-        .withColumnRenamed("sector", "setor") \
+    df = (
+        df.withColumnRenamed("date", "data")
+        .withColumnRenamed("close", "precoFechamento")
+        .withColumnRenamed("high", "precoMaximo")
+        .withColumnRenamed("low", "precoMinimo")
+        .withColumnRenamed("open", "precoAbertura")
+        .withColumnRenamed("volume", "volumeNegociacao")
+        .withColumnRenamed("ticker", "codigoAcao")
+        .withColumnRenamed("sector", "setor")
         .withColumnRenamed("company", "nomeEmpresa")
+    )
     return df
 
 
@@ -172,7 +176,7 @@ def calculate_aggregations(df: DataFrame) -> DataFrame:
     """
     df_agg = df.groupBy("setor").agg(
         avg("precoFechamento").alias("mediaFechamento"),
-        sum("volumeNegociacao").alias("totalVolume")
+        sum("volumeNegociacao").alias("totalVolume"),
     )
     return df.join(df_agg, on="setor", how="left")
 
@@ -188,7 +192,9 @@ def calculate_date_diff(df: DataFrame) -> DataFrame:
     """
     windowSpec = Window.partitionBy("codigoAcao").orderBy("data")
     df = df.withColumn("fechamentoAnterior", lag("precoFechamento").over(windowSpec))
-    df = df.withColumn("variacaoFechamento", col("precoFechamento") - col("fechamentoAnterior"))
+    df = df.withColumn(
+        "variacaoFechamento", col("precoFechamento") - col("fechamentoAnterior")
+    )
     df = df.drop("fechamentoAnterior")
     return df
 
@@ -202,11 +208,9 @@ def save_to_s3(df: DataFrame, output_path: str) -> None:
         output_path (str): The S3 path to save the DataFrame to.
     """
     df.show(10, truncate=False)
-    df.write \
-        .mode("append") \
-        .option("compression", "snappy") \
-        .partitionBy("dataproc", "setor") \
-        .parquet(output_path)
+    df.write.mode("append").option("compression", "snappy").partitionBy(
+        "dataproc", "setor"
+    ).parquet(output_path)
     logger.info(f"Data saved to: {output_path}")
 
 
@@ -262,6 +266,7 @@ def main():
     finally:
         job.commit()
         spark.stop()
+
 
 if __name__ == "__main__":
     main()

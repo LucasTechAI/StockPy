@@ -18,7 +18,9 @@ from datetime import datetime
 glue_client = boto3_client("glue")
 athena_client = boto3_client("athena", region_name="us-east-1")
 
-basicConfig(level=INFO, format="%(asctime)s - %(levelname)s - %(funcName)s - %(message)s")
+basicConfig(
+    level=INFO, format="%(asctime)s - %(levelname)s - %(funcName)s - %(message)s"
+)
 logger = getLogger(__name__)
 
 
@@ -28,12 +30,12 @@ TARGET_BUCKET = "stockpy"
 TARGET_PREFIX = "refined/news"
 TARGET_TABLE = "news_clean"
 
-args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+args = getResolvedOptions(sys.argv, ["JOB_NAME"])
 sc = SparkContext()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
 job = Job(glueContext)
-job.init(args['JOB_NAME'], args)
+job.init(args["JOB_NAME"], args)
 
 
 @staticmethod
@@ -48,15 +50,24 @@ def normalize_column_names(df: DataFrame) -> DataFrame:
     logger.info("Normalizing column names...")
     column_mapping = {}
     expected_columns = [
-        "title", "link", "source", "published_time", 
-        "company", "ticker", "sector", "search_term", "extracted_at"
+        "title",
+        "link",
+        "source",
+        "published_time",
+        "company",
+        "ticker",
+        "sector",
+        "search_term",
+        "extracted_at",
     ]
     current_columns = [col.lower().strip() for col in df.columns]
     missing_columns = []
     for expected_col in expected_columns:
         if expected_col not in current_columns:
-            possible_matches = [col for col in current_columns 
-                                if expected_col.replace('_', '') in col.replace('_', '')
+            possible_matches = [
+                col
+                for col in current_columns
+                if expected_col.replace("_", "") in col.replace("_", "")
             ]
             if possible_matches:
                 column_mapping[possible_matches[0]] = expected_col
@@ -85,26 +96,28 @@ def clean_data(df: DataFrame) -> DataFrame:
     logger.info("Starting data cleaning process...")
     df = normalize_column_names(df)
     required_columns = ["published_time", "extracted_at"]
-    
+
     for req_col in required_columns:
         if req_col not in df.columns:
             raise ValueError(f"Column '{req_col}' is required but was not found")
 
-    df = df \
-        .withColumn("published_date_str", regexp_replace(col("published_time"), "T.*", "")) \
-        .withColumn("extracted_date_str", regexp_replace(col("extracted_at"), "T.*", ""))
+    df = df.withColumn(
+        "published_date_str", regexp_replace(col("published_time"), "T.*", "")
+    ).withColumn("extracted_date_str", regexp_replace(col("extracted_at"), "T.*", ""))
 
-    df = df \
-        .withColumn("published_date", to_date(col("published_date_str"), "yyyy-MM-dd")) \
-        .withColumn("extracted_date", to_date(col("extracted_date_str"), "yyyy-MM-dd"))
+    df = df.withColumn(
+        "published_date", to_date(col("published_date_str"), "yyyy-MM-dd")
+    ).withColumn("extracted_date", to_date(col("extracted_date_str"), "yyyy-MM-dd"))
 
     df = df.filter(
-        col("published_date").isNotNull() &
-        col("extracted_date").isNotNull() &
-        (col("published_date") == col("extracted_date"))
+        col("published_date").isNotNull()
+        & col("extracted_date").isNotNull()
+        & (col("published_date") == col("extracted_date"))
     )
 
-    df = df.drop("published_date_str", "extracted_date_str", "published_date", "extracted_date")
+    df = df.drop(
+        "published_date_str", "extracted_date_str", "published_date", "extracted_date"
+    )
     df = df.dropDuplicates()
 
     if "link" in df.columns:
@@ -133,23 +146,21 @@ def save_to_s3_and_catalog(df: DataFrame) -> None:
         logger.warning("DataFrame is empty, skipping save...")
         return
 
-    proc_date = datetime.now().strftime('%Y%m%d')
-    output_path = f"s3://{TARGET_BUCKET}/{TARGET_PREFIX}/dataproc={proc_date}/"
+    proc_date = datetime.now().strftime("%Y%m%d")
+    output_path = f"s3://{TARGET_BUCKET}/{TARGET_PREFIX}"
     logger.info(f"Saving to {output_path}")
 
     df = df.withColumn("dataproc", lit(proc_date))
-    df.write \
-        .mode("append") \
-        .option("compression", "snappy") \
-        .partitionBy("dataproc") \
-        .parquet(output_path)
+    df.write.mode("append").option("compression", "snappy").partitionBy(
+        "dataproc"
+    ).parquet(output_path)
 
     dynamic_frame = DynamicFrame.fromDF(df, glueContext, "dynamic_frame")
     glueContext.write_dynamic_frame.from_catalog(
         frame=dynamic_frame,
         database=SOURCE_DB,
         table_name=TARGET_TABLE,
-        additional_options={"partitionKeys": ["dataproc"]}
+        additional_options={"partitionKeys": ["dataproc"]},
     )
     logger.info("Data registered in Glue Catalog.")
 
@@ -158,10 +169,7 @@ def save_to_s3_and_catalog(df: DataFrame) -> None:
 def ensure_target_table_exists() -> None:
     """Ensure that the target table exists in the Glue Catalog"""
     try:
-        glue_client.get_table(
-            DatabaseName=SOURCE_DB,
-            Name=TARGET_TABLE
-        )
+        glue_client.get_table(DatabaseName=SOURCE_DB, Name=TARGET_TABLE)
         logger.info(f"Tabela {SOURCE_DB}.{TARGET_TABLE} já existe no Glue Catalog.")
     except glue_client.exceptions.EntityNotFoundException:
         logger.warning(f"Tabela {SOURCE_DB}.{TARGET_TABLE} não existe. Criando...")
@@ -181,25 +189,23 @@ def ensure_target_table_exists() -> None:
                             {"Name": "ticker", "Type": "string"},
                             {"Name": "sector", "Type": "string"},
                             {"Name": "search_term", "Type": "string"},
-                            {"Name": "extracted_at", "Type": "string"}
+                            {"Name": "extracted_at", "Type": "string"},
                         ],
                         "Location": f"s3://{TARGET_BUCKET}/{TARGET_PREFIX}/",
                         "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
                         "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
                         "SerdeInfo": {
                             "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
-                            "Parameters": {"serialization.format": "1"}
-                        }
+                            "Parameters": {"serialization.format": "1"},
+                        },
                     },
-                    "PartitionKeys": [
-                        {"Name": "dataproc", "Type": "string"}
-                    ],
+                    "PartitionKeys": [{"Name": "dataproc", "Type": "string"}],
                     "TableType": "EXTERNAL_TABLE",
                     "Parameters": {
                         "classification": "parquet",
-                        "compressionType": "snappy"
-                    }
-                }
+                        "compressionType": "snappy",
+                    },
+                },
             )
             logger.info(f"Tabela {SOURCE_DB}.{TARGET_TABLE} criada com sucesso!")
         except ClientError as ce:
@@ -208,7 +214,9 @@ def ensure_target_table_exists() -> None:
 
 
 @staticmethod
-def add_partition_if_not_exists(database: str, table: str, proc_date: str, location: str) -> None:
+def add_partition_if_not_exists(
+    database: str, table: str, proc_date: str, location: str
+) -> None:
     """
     Add a partition to the Glue Catalog if it does not exist.
     Args:
@@ -219,9 +227,7 @@ def add_partition_if_not_exists(database: str, table: str, proc_date: str, locat
     """
     try:
         glue_client.get_partition(
-            DatabaseName=database,
-            TableName=table,
-            PartitionValues=[proc_date]
+            DatabaseName=database, TableName=table, PartitionValues=[proc_date]
         )
         logger.info(f"Partição {proc_date} já existe no Glue Catalog.")
     except glue_client.exceptions.EntityNotFoundException:
@@ -241,17 +247,17 @@ def add_partition_if_not_exists(database: str, table: str, proc_date: str, locat
                         {"Name": "ticker", "Type": "string"},
                         {"Name": "sector", "Type": "string"},
                         {"Name": "search_term", "Type": "string"},
-                        {"Name": "extracted_at", "Type": "string"}
+                        {"Name": "extracted_at", "Type": "string"},
                     ],
                     "Location": location,
                     "InputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
                     "OutputFormat": "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
                     "SerdeInfo": {
                         "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
-                        "Parameters": {"serialization.format": "1"}
-                    }
-                }
-            }
+                        "Parameters": {"serialization.format": "1"},
+                    },
+                },
+            },
         )
         logger.info(f"Partition {proc_date} created successfully.")
 
@@ -283,16 +289,20 @@ def repair_table_partitions(database: str, table: str) -> None:
                 QueryExecutionContext={"Database": database},
                 ResultConfiguration={
                     "OutputLocation": f"s3://{TARGET_BUCKET}/athena-query-results/"
-                }
+                },
             )
             qid = response["QueryExecutionId"]
             logger.info(f"MSCK REPAIR TABLE started on Athena (QueryExecutionId={qid})")
         except Exception as athena_error:
             logger.warning(f"MSCK REPAIR TABLE failed on Athena: {athena_error}")
             try:
-                proc_date = datetime.now().strftime('%Y%m%d')
-                partition_location = f"s3://{TARGET_BUCKET}/{TARGET_PREFIX}/dataproc={proc_date}/"
-                add_partition_if_not_exists(database, table, proc_date, partition_location)
+                proc_date = datetime.now().strftime("%Y%m%d")
+                partition_location = (
+                    f"s3://{TARGET_BUCKET}/{TARGET_PREFIX}/dataproc={proc_date}/"
+                )
+                add_partition_if_not_exists(
+                    database, table, proc_date, partition_location
+                )
             except Exception as manual_error:
                 logger.error(f"Error adding partition manually: {manual_error}")
 
@@ -308,8 +318,7 @@ def main():
         if SOURCE_TABLE:
             logger.info(f"Reading from Catalog: {SOURCE_DB}.{SOURCE_TABLE}")
             dyf_raw = glueContext.create_dynamic_frame.from_catalog(
-                database=SOURCE_DB,
-                table_name=SOURCE_TABLE
+                database=SOURCE_DB, table_name=SOURCE_TABLE
             )
             df_raw = dyf_raw.toDF()
 
