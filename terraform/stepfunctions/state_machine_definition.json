@@ -69,7 +69,7 @@
     "FailState": {
       "Type": "Fail",
       "Error": "JobFailed",
-      "Cause": "A execução do job falhou."
+      "Cause": "Error occurred during ETL job execution"
     }
   }
 }
