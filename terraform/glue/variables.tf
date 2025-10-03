@@ -3,7 +3,7 @@ variable "role_name" {
 }
 
 variable "script_location" {
-  default = "s3://stockpy-bucket/scripts/"
+  default = "s3://stockpy/scripts/"
 }
 
 variable "default_arguments" {
